@@ -2078,6 +2078,113 @@ void IntegrityCheckBypass::re9_heartbeat_bypass() {
                 } catch (...) {}
             }
 
+            // Re-verify any previously-seeded candidates (from the heap fallback below)
+            // against the current frame. This is required because the heap walk is
+            // throttled and won't revisit the cluster's region every frame.
+            if (!candidates.empty()) {
+                for (auto addr : candidates) {
+                    try {
+                        auto* ints = reinterpret_cast<uint32_t*>(addr);
+                        if (ints[-1] != 1 || ints[HEARTBEAT_COUNT] != 0) {
+                            continue;
+                        }
+                        bool all_valid = true;
+                        bool early_detect = (ints[0] == 0);
+                        for (size_t j = 0; j < HEARTBEAT_COUNT; j++) {
+                            auto val = ints[j];
+                            bool in_range = val > 0 && val <= frame_count && (frame_count - val) < (uint32_t)MAX_DISTANCE;
+                            if (!in_range) {
+                                all_valid = false;
+                            }
+                            if (j > 0 && !in_range) {
+                                early_detect = false;
+                            }
+                        }
+                        if (all_valid || early_detect) {
+                            this_frame.push_back(addr);
+                        }
+                    } catch (...) {}
+                }
+            }
+
+            // Fallback: in some game builds the heartbeat cluster moved out of the
+            // renderer struct into a separate heap allocation (observed in MHS3
+            // after a game update: the cluster is no longer within renderer+0x2000..0x4000).
+            // Walk committed anonymous RW pages and apply the same signature check.
+            // Only runs while we have no candidates at all (the re-verify block above
+            // handles confirming existing candidates).
+            if (candidates.empty() && this_frame.empty()) {
+                static uintptr_t heap_scan_resume = 0;
+                static int heap_scan_attempts = 0;
+                const auto game = utility::get_executable();
+                const auto game_size = utility::get_module_size(game).value_or(0);
+                const auto exe = (uintptr_t)game;
+                const auto exe_end = exe + game_size;
+
+                // Throttle: only walk a bounded chunk of address space per frame.
+                MEMORY_BASIC_INFORMATION mbi{};
+                uintptr_t addr = heap_scan_resume;
+                uintptr_t stop = addr + 0x10000000; // 256 MiB per frame
+                if (stop < addr) stop = (uintptr_t)-1; // wrap guard
+
+                while (addr < stop && this_frame.empty()) {
+                    if (VirtualQuery((LPCVOID)addr, &mbi, sizeof(mbi)) == 0) {
+                        break;
+                    }
+
+                    uintptr_t region_start = (uintptr_t)mbi.BaseAddress;
+                    uintptr_t region_end = region_start + mbi.RegionSize;
+                    addr = region_end;
+
+                    // Only committed anonymous RW regions, skip the exe image and tiny regions.
+                    if (mbi.State != MEM_COMMIT || mbi.Protect != PAGE_READWRITE) {
+                        continue;
+                    }
+                    if (mbi.Type == MEM_IMAGE || mbi.Type == MEM_MAPPED) {
+                        continue;
+                    }
+                    if (region_start >= exe && region_start < exe_end) {
+                        continue;
+                    }
+                    if (mbi.RegionSize < (HEARTBEAT_COUNT * 4 + 8)) {
+                        continue;
+                    }
+
+                    try {
+                        auto* base = reinterpret_cast<uint32_t*>(region_start);
+                        size_t n = mbi.RegionSize / sizeof(uint32_t);
+                        for (size_t i = 1; i + HEARTBEAT_COUNT < n; i++) {
+                            if (base[i - 1] != 1 || base[i + HEARTBEAT_COUNT] != 0) {
+                                continue;
+                            }
+                            bool all_valid = true;
+                            bool early_detect = (base[i] == 0);
+                            for (size_t j = 0; j < HEARTBEAT_COUNT; j++) {
+                                auto val = base[i + j];
+                                bool in_range = val > 0 && val <= frame_count && (frame_count - val) < (uint32_t)MAX_DISTANCE;
+                                if (!in_range) {
+                                    all_valid = false;
+                                }
+                                if (j > 0 && !in_range) {
+                                    early_detect = false;
+                                }
+                            }
+                            if (all_valid || early_detect) {
+                                this_frame.push_back((uintptr_t)&base[i]);
+                            }
+                        }
+                    } catch (...) {}
+                }
+
+                if (addr == 0 || addr >= (uintptr_t)0x7FFFFFFFFFFF) {
+                    heap_scan_resume = 0;
+                    heap_scan_attempts++;
+                    spdlog::warn("[IntegrityCheckBypass] Heap heartbeat scan completed pass {} with no candidate", heap_scan_attempts);
+                } else {
+                    heap_scan_resume = addr;
+                }
+            }
+
             if (candidates.empty()) {
                 // First scan, seed candidates
                 candidates = std::move(this_frame);
@@ -2096,8 +2203,14 @@ void IntegrityCheckBypass::re9_heartbeat_bypass() {
 
                 if (candidates.size() == 1 && confirmation_count >= CONFIRMATIONS_NEEDED) {
                     heartbeat_offset_start = (uint32_t*)candidates[0];
-                    spdlog::info("[IntegrityCheckBypass] Found heartbeat cluster at renderer+0x{:X} after {} confirmations at frame count {}, syncing it to frame count every frame now",
-                        (uintptr_t)heartbeat_offset_start - renderer_addr, confirmation_count, frame_count);
+                    const auto off = (uintptr_t)heartbeat_offset_start - renderer_addr;
+                    if (off < 0x10000) {
+                        spdlog::info("[IntegrityCheckBypass] Found heartbeat cluster at renderer+0x{:X} after {} confirmations at frame count {}, syncing it to frame count every frame now",
+                            off, confirmation_count, frame_count);
+                    } else {
+                        spdlog::info("[IntegrityCheckBypass] Found heartbeat cluster at 0x{:X} (heap, renderer+0x{:X}) after {} confirmations at frame count {}, syncing it to frame count every frame now",
+                            (uintptr_t)heartbeat_offset_start, off, confirmation_count, frame_count);
+                    }
                 } else if (candidates.empty()) {
                     // Lost all candidates, restart
                     confirmation_count = 0;
